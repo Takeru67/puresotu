@@ -1,0 +1,355 @@
+# ==========================================
+# Library Imports: ライブラリのインポート
+# ==========================================
+import os
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision import transforms
+from PIL import Image
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, f1_score, ConfusionMatrixDisplay
+from torch.cuda.amp import autocast, GradScaler
+import timm
+from torch.optim.lr_scheduler import OneCycleLR
+
+# ==========================================
+# Config: 設定
+# ==========================================
+class Config:
+    # === シード値の固定（再現性の確保） ===
+    seed = 8888 
+    
+    # === ディレクトリパスの設定 ===
+    train_dir = "D:/puresotu/workspace/BreastCancer/train"
+    val_dir = "D:/puresotu/workspace/BreastCancer/valid"
+    test_dir = "D:/puresotu/workspace/BreastCancer/test"
+    output_dir = "D:/puresotu/workspace/ts"
+    
+    # === モデル・学習の設定 ===
+    model_name = "tf_efficientnet_b4_ns"
+    img_size = 380
+    batch_size = 16 
+    num_epochs = 40 
+    learning_rate = 4e-4 
+    
+    # === その他システム設定 ===
+    num_workers = 2 
+    classes = ["0", "1"]
+
+# ==========================================
+# Utils: ユーティリティ関数
+# ==========================================
+def set_seed(seed=1234):
+    # === 乱数シードを一括で固定 ===
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+# ==========================================
+# Dataset: データセット定義
+# ==========================================
+class BreastCancerDataset(Dataset):
+    # === 学習・検証用データセットクラス ===
+    def __init__(self, root_dir, classes, transform=None):
+        self.root_dir = root_dir
+        self.classes = classes
+        self.transform = transform
+        self.data = []
+        self._prepare_data()
+
+    def _prepare_data(self):
+        for class_label in self.classes:
+            class_path = os.path.join(self.root_dir, class_label)
+            if not os.path.isdir(class_path):
+                continue
+            label_index = self.classes.index(class_label)
+            for img_file in os.listdir(class_path):
+                img_full_path = os.path.join(class_path, img_file)
+                if os.path.isfile(img_full_path) and img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    self.data.append((img_full_path, label_index))
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        img_path, label = self.data[idx]
+        try:
+            image = Image.open(img_path).convert('RGB')
+        except Exception:
+            image = Image.new('RGB', (Config.img_size, Config.img_size))
+        
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+class TestDataset(Dataset):
+    # === テスト（提出用予測）用データセットクラス ===
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.image_files = [f for f in os.listdir(root_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_file = self.image_files[idx]
+        img_path = os.path.join(self.root_dir, img_file)
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, img_file
+
+# ==========================================
+# Loss Function: 損失関数
+# ==========================================
+class LabelSmoothingBCE(nn.Module):
+    # === ラベルスムージング付きBCE損失（過学習抑制） ===
+    def __init__(self, smoothing=0.1):
+        super(LabelSmoothingBCE, self).__init__()
+        self.smoothing = smoothing
+        self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(self, inputs, targets):
+        with torch.no_grad():
+            # ラベルを0.5に少し寄せることで自信過剰を抑制
+            targets = targets * (1.0 - self.smoothing) + 0.5 * self.smoothing
+        return self.bce(inputs, targets)
+
+# ==========================================
+# Model Definition: モデル定義
+# ==========================================
+def get_model(device):
+    # === EfficientNet-B4モデルの構築 ===
+    print(f"Loading {Config.model_name}...")
+    model = timm.create_model(
+        Config.model_name,
+        pretrained=True,
+        num_classes=1, # 0か1かの二値分類
+        drop_rate=0.5,      
+        drop_path_rate=0.25 
+    )
+    return model.to(device)
+
+# ==========================================
+# Main Execution Block: メイン処理
+# ==========================================
+if __name__ == '__main__':
+    # === 1. セットアップ ===
+    set_seed(Config.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # === 2. データ拡張（Transforms）の設定 ===
+    train_transforms = transforms.Compose([
+        transforms.Resize((Config.img_size, Config.img_size)),
+        transforms.RandAugment(num_ops=2, magnitude=15),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.1) 
+    ])
+
+    val_test_transforms = transforms.Compose([
+        transforms.Resize((Config.img_size, Config.img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    # === 3. データローダーの作成 ===
+    train_dataset = BreastCancerDataset(Config.train_dir, Config.classes, train_transforms)
+    val_dataset = BreastCancerDataset(Config.val_dir, Config.classes, val_test_transforms)
+    test_dataset = TestDataset(Config.test_dir, transform=val_test_transforms)
+
+    # 不均衡データ対策: WeightedRandomSampler
+    targets = [label for _, label in train_dataset.data]
+    class_sample_count = np.array([len(np.where(targets == t)[0]) for t in np.unique(targets)])
+    weight = 1. / class_sample_count
+    samples_weight = np.array([weight[t] for t in targets])
+    samples_weight = torch.from_numpy(samples_weight)
+    sampler = WeightedRandomSampler(samples_weight.type('torch.DoubleTensor'), len(samples_weight))
+
+    train_loader = DataLoader(train_dataset, batch_size=Config.batch_size, sampler=sampler, num_workers=Config.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=Config.batch_size, shuffle=False, num_workers=Config.num_workers, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=Config.batch_size, shuffle=False, num_workers=Config.num_workers, pin_memory=True)
+
+    # === 4. 最適化アルゴリズム・スケジューラの設定 ===
+    model = get_model(device)
+    criterion = LabelSmoothingBCE(smoothing=0.05).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=Config.learning_rate, weight_decay=2e-2)
+    scheduler = OneCycleLR(
+        optimizer, 
+        max_lr=Config.learning_rate, 
+        steps_per_epoch=len(train_loader), 
+        epochs=Config.num_epochs
+    )
+    scaler = GradScaler()
+
+    # === 5. 出力ディレクトリ・変数の準備 ===
+    weight_dir = os.path.join(Config.output_dir, 'Weight')
+    prediction_dir = os.path.join(Config.output_dir, 'Prediction')
+    os.makedirs(weight_dir, exist_ok=True)
+    os.makedirs(prediction_dir, exist_ok=True)
+
+    best_auc = 0.0
+    period_best_auc = 0.0
+    period_best_thr = 0.5 
+    save_path = os.path.join(weight_dir, 'best_model_b4_final.pth')
+    period_best_model_path = os.path.join(weight_dir, 'temp_period_best.pth')
+
+    # === 6. 学習ループ（Training Loop） ===
+    for epoch in range(Config.num_epochs):
+        # --- 学習フェーズ ---
+        model.train()
+        running_loss = 0.0
+        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{Config.num_epochs} [Train]")
+        
+        for inputs, labels in loop:
+            inputs, labels = inputs.to(device), labels.to(device)
+            labels = labels.unsqueeze(1).float()
+            
+            optimizer.zero_grad()
+            with autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            
+            running_loss += loss.item() * inputs.size(0)
+            loop.set_postfix(loss=loss.item())
+        
+        epoch_train_loss = running_loss / len(train_loader.dataset)
+        
+        # --- 検証フェーズ（5-Way TTA適用） ---
+        model.eval()
+        val_running_loss = 0.0
+        all_val_labels, all_val_probs = [], []
+        
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                labels_float = labels.unsqueeze(1).float()
+                
+                outputs = model(inputs)
+                val_running_loss += criterion(outputs, labels_float).item() * inputs.size(0)
+                
+                # TTA: 元画像 + 左右反転 + 上下反転 + 90度回転 + 270度回転
+                p1 = torch.sigmoid(outputs).view(-1)
+                p2 = torch.sigmoid(model(torch.flip(inputs, dims=[3]))).view(-1)
+                p3 = torch.sigmoid(model(torch.flip(inputs, dims=[2]))).view(-1)
+                p4 = torch.sigmoid(model(torch.rot90(inputs, k=1, dims=[2, 3]))).view(-1)
+                p5 = torch.sigmoid(model(torch.rot90(inputs, k=3, dims=[2, 3]))).view(-1)
+                
+                probs_avg = (p1 + p2 + p3 + p4 + p5) / 5.0
+                all_val_labels.extend(labels.cpu().numpy())
+                all_val_probs.extend(probs_avg.cpu().numpy())
+
+        epoch_val_loss = val_running_loss / len(val_loader.dataset)
+        val_auc = roc_auc_score(all_val_labels, all_val_probs) if len(np.unique(all_val_labels)) > 1 else 0.5
+        print(f"Epoch {epoch+1} | Train Loss: {epoch_train_loss:.4f} | Val Loss: {epoch_val_loss:.4f} | Val AUC (5-TTA): {val_auc:.4f}")
+
+        # --- ベストモデルの保存（Global） ---
+        if val_auc > best_auc:
+            best_auc = val_auc
+            torch.save(model.state_dict(), save_path)
+            print(f">>> Best model saved! (AUC: {best_auc:.4f})")
+
+        # --- 区間ベストの更新（10エポックごと用） ---
+        if val_auc > period_best_auc:
+            period_best_auc = val_auc
+            torch.save(model.state_dict(), period_best_model_path)
+            
+            # 最適閾値の計算
+            y_true_temp, y_probs_temp = np.array(all_val_labels), np.array(all_val_probs)
+            best_f1_temp, temp_thr = 0.0, 0.5
+            for th in np.arange(0.01, 1.0, 0.01):
+                score_temp = f1_score(y_true_temp, (y_probs_temp >= th).astype(int))
+                if score_temp > best_f1_temp:
+                    best_f1_temp, temp_thr = score_temp, th
+            period_best_thr = temp_thr
+            print(f"  [Period Update] Best AUC: {period_best_auc:.4f} (Thr: {period_best_thr:.2f})")
+
+        # --- 10エポックごとの予測提出ファイル作成 ---
+        if (epoch + 1) % 10 == 0:
+            print(f"\n=== Generating Submission for Period Epoch {epoch-8}-{epoch+1} ===")
+            model.load_state_dict(torch.load(period_best_model_path))
+            model.eval()
+            predictions = []
+            with torch.no_grad():
+                for images, filenames in tqdm(test_loader, desc="Period Prediction"):
+                    images = images.to(device)
+                    # 予測時もTTA適用
+                    p_avg = (torch.sigmoid(model(images)).view(-1) + 
+                             torch.sigmoid(model(torch.flip(images, dims=[3]))).view(-1) + 
+                             torch.sigmoid(model(torch.flip(images, dims=[2]))).view(-1) + 
+                             torch.sigmoid(model(torch.rot90(images, k=1, dims=[2, 3]))).view(-1) + 
+                             torch.sigmoid(model(torch.rot90(images, k=3, dims=[2, 3]))).view(-1)) / 5.0
+                    preds = (p_avg >= period_best_thr).float().cpu().numpy().astype(int)
+                    for fn, p in zip(filenames, preds):
+                        predictions.append((os.path.splitext(fn)[0], p))
+            
+            df = pd.DataFrame(predictions, columns=['image_id', 'label'])
+            df.to_csv(os.path.join(prediction_dir, f'submission_period_epoch_{epoch+1}_auc{period_best_auc:.4f}.csv'), index=False)
+            period_best_auc = 0.0
+
+    # === 7. 最終評価と混同行列の生成 ===
+    print("\n=== Final Evaluation with Best Model ===")
+    model.load_state_dict(torch.load(save_path))
+    model.eval()
+    y_true, y_probs = [], []
+    with torch.no_grad():
+        for inputs, labels in tqdm(val_loader, desc="Final Validating"):
+            inputs = inputs.to(device)
+            p_avg = (torch.sigmoid(model(inputs)).view(-1) + 
+                     torch.sigmoid(model(torch.flip(inputs, dims=[3]))).view(-1) + 
+                     torch.sigmoid(model(torch.flip(inputs, dims=[2]))).view(-1) + 
+                     torch.sigmoid(model(torch.rot90(inputs, k=1, dims=[2, 3]))).view(-1) + 
+                     torch.sigmoid(model(torch.rot90(inputs, k=3, dims=[2, 3]))).view(-1)) / 5.0
+            y_true.extend(labels.numpy())
+            y_probs.extend(p_avg.cpu().numpy())
+
+    y_true, y_probs = np.array(y_true), np.array(y_probs)
+    best_thr, best_f1 = 0.5, 0.0
+    for th in np.arange(0.01, 1.0, 0.01):
+        score = f1_score(y_true, (y_probs >= th).astype(int))
+        if score > best_f1:
+            best_f1, best_thr = score, th
+
+    print(f"\nBest Threshold: {best_thr:.2f} | Best F1 Score: {best_f1:.4f} | AUC: {roc_auc_score(y_true, y_probs):.4f}")
+
+    # 混同行列の表示・保存
+    disp = ConfusionMatrixDisplay(confusion_matrix=confusion_matrix(y_true, (y_probs >= best_thr).astype(int)), display_labels=Config.classes)
+    disp.plot(cmap=plt.cm.Blues)
+    plt.savefig(os.path.join(Config.output_dir, 'confusion_matrix_b4_final.png'))
+
+    # === 8. 最終提出用CSVの生成 ===
+    print(f"\nGenerating Final Submission with Threshold: {best_thr:.2f}")
+    predictions = []
+    with torch.no_grad():
+        for images, filenames in tqdm(test_loader, desc="Final Prediction"):
+            images = images.to(device)
+            p_avg = (torch.sigmoid(model(images)).view(-1) + 
+                     torch.sigmoid(model(torch.flip(images, dims=[3]))).view(-1) + 
+                     torch.sigmoid(model(torch.flip(images, dims=[2]))).view(-1) + 
+                     torch.sigmoid(model(torch.rot90(images, k=1, dims=[2, 3]))).view(-1) + 
+                     torch.sigmoid(model(torch.rot90(images, k=3, dims=[2, 3]))).view(-1)) / 5.0
+            preds = (p_avg >= best_thr).float().cpu().numpy().astype(int)
+            for fn, p in zip(filenames, preds):
+                predictions.append((os.path.splitext(fn)[0], p))
+
+    pd.DataFrame(predictions, columns=['image_id', 'label']).to_csv(os.path.join(Config.output_dir, 'Prediction', 'submission_b4_final.csv'), index=False)
+    print("Process Complete. Results saved.")
